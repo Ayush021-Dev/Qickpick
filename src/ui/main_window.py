@@ -9,6 +9,7 @@ import os
 from typing import List, Dict
 from ..core.face_recognizer import FaceRecognizer, Person
 from ..core.face_detector import FaceLocation, FaceDetector
+from ..core.folder_monitor import FolderMonitor
 import cv2
 import numpy as np
 import shutil
@@ -89,6 +90,7 @@ class PersonCard(QFrame):
         self.person = person
         self.recognizer = recognizer
         self.selected_checkbox = QCheckBox()
+        self.name_label = None  # Store reference to name label
         self.setCursor(Qt.PointingHandCursor)
         self.setup_ui()
     def setup_ui(self):
@@ -113,12 +115,31 @@ class PersonCard(QFrame):
         layout.addWidget(thumb_label)
         # Info
         info_layout = QVBoxLayout()
-        name_label = QLabel(self.person.name)
-        name_label.setFont(QFont("Arial", 12, QFont.Bold))
-        info_layout.addWidget(name_label)
+        self.name_label = QLabel(self.person.name)  # Store reference
+        self.name_label.setFont(QFont("Arial", 12, QFont.Bold))
+        info_layout.addWidget(self.name_label)
         count_label = QLabel(f"{len(self.person.photo_paths)} photos")
         info_layout.addWidget(count_label)
         layout.addLayout(info_layout)
+        
+        # Add rename button
+        rename_btn = QPushButton("Rename")
+        rename_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        rename_btn.clicked.connect(self.rename_person)
+        layout.addWidget(rename_btn)
+        
         self.setLayout(layout)
     def get_face_thumbnail(self):
         # Use the most central face in the cluster as thumbnail
@@ -149,13 +170,35 @@ class PersonCard(QFrame):
         if event.button() == Qt.LeftButton and not self.selected_checkbox.underMouse():
             dlg = PhotoGalleryDialog(self.person, self)
             dlg.exec_()
+    def rename_person(self):
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Person",
+            "Enter new name:",
+            text=self.person.name
+        )
+        if ok and new_name and new_name != self.person.name:
+            self.recognizer.rename_person(self.person.id, new_name)
+            self.person.name = new_name
+            # Update the name label using the stored reference
+            if self.name_label:
+                self.name_label.setText(new_name)
 
 class MainWindow(QMainWindow):
+    new_photo_signal = pyqtSignal(str)
+    photo_deleted_signal = pyqtSignal(str)
+    monitoring_started = pyqtSignal()
+    monitoring_stopped = pyqtSignal()
+    photo_processed = pyqtSignal(str)
+    
     def __init__(self):
         super().__init__()
         self.recognizer = FaceRecognizer()
         self.person_cards = []
+        self.folder_monitor = None
         self.setup_ui()
+        self.new_photo_signal.connect(self.handle_new_photo)
+        self.photo_deleted_signal.connect(self.handle_photo_deleted)
         
     def setup_ui(self):
         self.setWindowTitle("Face Organizer")
@@ -173,6 +216,11 @@ class MainWindow(QMainWindow):
         self.select_folder_btn.clicked.connect(self.select_folder)
         controls_layout.addWidget(self.select_folder_btn)
         
+        self.monitor_btn = QPushButton("Start Monitoring")
+        self.monitor_btn.clicked.connect(self.toggle_monitoring)
+        self.monitor_btn.setEnabled(False)
+        controls_layout.addWidget(self.monitor_btn)
+        
         self.merge_btn = QPushButton("Merge Selected")
         self.merge_btn.clicked.connect(self.merge_selected)
         controls_layout.addWidget(self.merge_btn)
@@ -182,6 +230,10 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.progress_bar)
         
         layout.addLayout(controls_layout)
+        
+        # Status label
+        self.status_label = QLabel("No folder selected")
+        layout.addWidget(self.status_label)
         
         # People grid
         scroll_area = QScrollArea()
@@ -210,6 +262,9 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background-color: #1976D2;
             }
+            QPushButton:disabled {
+                background-color: #BDBDBD;
+            }
             QProgressBar {
                 border: 1px solid #ccc;
                 border-radius: 4px;
@@ -217,6 +272,9 @@ class MainWindow(QMainWindow):
             }
             QProgressBar::chunk {
                 background-color: #2196F3;
+            }
+            QLabel {
+                color: #424242;
             }
         """)
         
@@ -228,6 +286,7 @@ class MainWindow(QMainWindow):
     def process_folder(self, folder_path: str):
         self.progress_bar.setVisible(True)
         self.select_folder_btn.setEnabled(False)
+        self.status_label.setText(f"Processing folder: {folder_path}")
         
         self.processing_thread = ProcessingThread(self.recognizer, folder_path)
         self.processing_thread.progress.connect(self.progress_bar.setValue)
@@ -238,12 +297,66 @@ class MainWindow(QMainWindow):
     def processing_finished(self):
         self.progress_bar.setVisible(False)
         self.select_folder_btn.setEnabled(True)
+        self.monitor_btn.setEnabled(True)
         self.update_people_grid()
+        self.status_label.setText("Processing complete. Ready to monitor for new photos.")
         
     def processing_error(self, error_msg: str):
         QMessageBox.critical(self, "Error", f"An error occurred: {error_msg}")
         self.progress_bar.setVisible(False)
         self.select_folder_btn.setEnabled(True)
+        self.status_label.setText("Error occurred during processing.")
+        
+    def toggle_monitoring(self):
+        if self.folder_monitor and self.folder_monitor.is_active():
+            self.folder_monitor.stop()
+            self.monitor_btn.setText("Start Monitoring")
+            self.status_label.setText("Monitoring stopped.")
+            self.monitoring_stopped.emit()
+        else:
+            self.start_monitoring()
+            
+    def start_monitoring(self):
+        if not self.folder_monitor:
+            self.folder_monitor = FolderMonitor(
+                self.recognizer.current_folder,
+                lambda path: self.new_photo_signal.emit(path),
+                lambda path: self.photo_deleted_signal.emit(path)
+            )
+        self.folder_monitor.start()
+        self.monitor_btn.setText("Stop Monitoring")
+        self.status_label.setText("Monitoring for new photos...")
+        self.monitoring_started.emit()
+        
+    def handle_new_photo(self, photo_path: str):
+        try:
+            self.recognizer.process_single_photo(photo_path)
+            self.update_people_grid()
+            self.status_label.setText(f"Processed new photo: {os.path.basename(photo_path)}")
+            self.photo_processed.emit(photo_path)
+        except PermissionError as e:
+            error_msg = str(e)
+            self.status_label.setText(f"Permission error: {os.path.basename(photo_path)}")
+            QMessageBox.warning(
+                self,
+                "Permission Error",
+                f"Cannot access the photo due to permission restrictions.\n\n"
+                f"Please ensure the application has permission to access the file:\n{photo_path}\n\n"
+                f"Try moving the photo to a different folder or running the application as administrator."
+            )
+        except Exception as e:
+            error_msg = str(e)
+            self.status_label.setText(f"Error: {os.path.basename(photo_path)}")
+            QMessageBox.warning(
+                self,
+                "Processing Error",
+                f"Failed to process the photo:\n{photo_path}\n\nError: {error_msg}"
+            )
+            
+    def closeEvent(self, event):
+        # Hide the window instead of closing
+        event.ignore()
+        self.hide()
         
     def update_people_grid(self):
         # Clear existing cards
@@ -278,4 +391,74 @@ class MainWindow(QMainWindow):
                 self.recognizer.people[main_id].face_indices.extend(self.recognizer.people[other_id].face_indices)
                 del self.recognizer.people[other_id]
         self.update_people_grid()
-        QMessageBox.information(self, "Merge Complete", f"Merged {len(selected_ids)} people into one.") 
+        QMessageBox.information(self, "Merge Complete", f"Merged {len(selected_ids)} people into one.")
+        
+    def handle_photo_deleted(self, photo_path: str):
+        try:
+            # First, verify the photo exists in our data
+            has_photo = False
+            for person in self.recognizer.people.values():
+                if photo_path in person.photo_paths:
+                    has_photo = True
+                    person.photo_paths.remove(photo_path)
+            
+            if not has_photo:
+                # Photo wasn't in our data, just update UI
+                self.update_people_grid()
+                self.status_label.setText(f"Photo not found in database: {os.path.basename(photo_path)}")
+                return
+            
+            # Find indices of faces to remove
+            indices_to_remove = []
+            for i, (path, _) in enumerate(self.recognizer.face_data):
+                if path == photo_path:
+                    indices_to_remove.append(i)
+            
+            if not indices_to_remove:
+                # No faces to remove, just update UI
+                self.update_people_grid()
+                self.status_label.setText(f"Removed photo: {os.path.basename(photo_path)}")
+                return
+            
+            # Create a mapping of old indices to new indices
+            index_mapping = {}
+            current_new_index = 0
+            for i in range(len(self.recognizer.face_data)):
+                if i not in indices_to_remove:
+                    index_mapping[i] = current_new_index
+                    current_new_index += 1
+            
+            # Remove face data in reverse order
+            for i in sorted(indices_to_remove, reverse=True):
+                if i < len(self.recognizer.face_data):
+                    del self.recognizer.face_data[i]
+                if i < len(self.recognizer.face_encodings):
+                    del self.recognizer.face_encodings[i]
+            
+            # Update face indices in people using the mapping
+            for person in self.recognizer.people.values():
+                new_indices = []
+                for old_idx in person.face_indices:
+                    if old_idx not in indices_to_remove and old_idx in index_mapping:
+                        new_indices.append(index_mapping[old_idx])
+                person.face_indices = new_indices
+            
+            # Remove people with no photos
+            people_to_remove = []
+            for person_id, person in self.recognizer.people.items():
+                if not person.photo_paths:
+                    people_to_remove.append(person_id)
+            
+            for person_id in people_to_remove:
+                del self.recognizer.people[person_id]
+            
+            # Update the UI
+            self.update_people_grid()
+            self.status_label.setText(f"Removed photo: {os.path.basename(photo_path)}")
+            
+        except Exception as e:
+            # Log the error but don't show error message since the photo was actually removed
+            print(f"Error during cleanup after photo removal: {str(e)}")
+            # Still update the UI to reflect the changes
+            self.update_people_grid()
+            self.status_label.setText(f"Removed photo: {os.path.basename(photo_path)}") 

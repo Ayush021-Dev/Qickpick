@@ -4,6 +4,8 @@ import face_recognition
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+import os
 
 @dataclass
 class FaceLocation:
@@ -16,6 +18,11 @@ class FaceLocation:
 class FaceDetector:
     def __init__(self, confidence_threshold: float = 0.6):
         self.confidence_threshold = confidence_threshold
+        # Ensure dlib/face_recognition can find the model
+        model_path = get_model_path()
+        os.environ['DLIB_FACE_PREDICTOR_PATH'] = model_path
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
         
     def detect_faces(self, image_path: str) -> List[FaceLocation]:
         """
@@ -67,4 +74,16 @@ class FaceDetector:
             face_location.top:face_location.bottom,
             face_location.left:face_location.right
         ]
-        return face_image 
+        return face_image
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+MODEL_FILENAME = 'shape_predictor_68_face_landmarks.dat'
+MODEL_RELATIVE_PATH = os.path.join('models', MODEL_FILENAME)
+
+def get_model_path():
+    return resource_path(MODEL_RELATIVE_PATH) 

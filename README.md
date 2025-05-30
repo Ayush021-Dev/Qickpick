@@ -48,4 +48,3 @@ python main.py
   - `config/` - Configuration and settings
 - `assets/` - Application resources (images, icons, etc.)
 - `tests/` - Unit tests
-
